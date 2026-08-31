@@ -1,0 +1,207 @@
+"""
+Локальный агент для DeepSeek API.
+
+Авторизация: ключ берётся из переменной окружения DEEPSEEK_API_KEY.
+Форма: выбор модели и параметров запроса (выпадающие списки + поля).
+Ответ: отдельное окно.
+
+Зависимости: pip install openai
+Запуск:      python deepseek_agent.py
+"""
+
+import os
+import threading
+import tkinter as tk
+from tkinter import ttk, messagebox, scrolledtext
+
+from openai import OpenAI
+
+BASE_URL = "https://api.deepseek.com"
+
+MODELS = [
+    "deepseek-chat",      # DeepSeek-V3, обычный диалог
+    "deepseek-reasoner",  # DeepSeek-R1, рассуждающая модель
+]
+
+TEMPERATURES = ["0.0", "0.3", "0.7", "1.0", "1.3", "1.5", "2.0"]
+MAX_TOKENS = ["1024", "2048", "4096", "8192"]
+
+
+class DeepSeekAgent(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("DeepSeek Agent — параметры запроса")
+        self.geometry("640x520")
+        self.resizable(True, True)
+
+        api_key = os.environ.get("DEEPSEEK_API_KEY")
+        if not api_key:
+            messagebox.showerror(
+                "Нет ключа",
+                "Переменная окружения DEEPSEEK_API_KEY не задана.\n"
+                "Установите её и перезапустите приложение.",
+            )
+            self.destroy()
+            return
+
+        self.client = OpenAI(api_key=api_key, base_url=BASE_URL)
+        self._busy = False
+        self._build_form()
+
+    # ---------- UI: форма ----------
+
+    def _build_form(self):
+        pad = {"padx": 10, "pady": 5}
+
+        ttk.Label(self, text="Модель (LLM):").grid(row=0, column=0, sticky="w", **pad)
+        self.model_var = tk.StringVar(value=MODELS[0])
+        ttk.Combobox(
+            self, textvariable=self.model_var, values=MODELS, state="readonly", width=30
+        ).grid(row=0, column=1, sticky="w", **pad)
+
+        ttk.Label(self, text="Temperature:").grid(row=1, column=0, sticky="w", **pad)
+        self.temp_var = tk.StringVar(value="1.0")
+        ttk.Combobox(
+            self, textvariable=self.temp_var, values=TEMPERATURES, width=30
+        ).grid(row=1, column=1, sticky="w", **pad)
+
+        ttk.Label(self, text="Max tokens:").grid(row=2, column=0, sticky="w", **pad)
+        self.tokens_var = tk.StringVar(value="4096")
+        ttk.Combobox(
+            self, textvariable=self.tokens_var, values=MAX_TOKENS, width=30
+        ).grid(row=2, column=1, sticky="w", **pad)
+
+        ttk.Label(self, text="Stream:").grid(row=3, column=0, sticky="w", **pad)
+        self.stream_var = tk.StringVar(value="Нет")
+        ttk.Combobox(
+            self, textvariable=self.stream_var, values=["Нет", "Да"],
+            state="readonly", width=30,
+        ).grid(row=3, column=1, sticky="w", **pad)
+
+        ttk.Label(self, text="System prompt:").grid(row=4, column=0, sticky="nw", **pad)
+        self.system_text = scrolledtext.ScrolledText(self, height=4, wrap=tk.WORD)
+        self.system_text.insert("1.0", "You are a helpful assistant.")
+        self.system_text.grid(row=4, column=1, sticky="nsew", **pad)
+
+        ttk.Label(self, text="Запрос:").grid(row=5, column=0, sticky="nw", **pad)
+        self.prompt_text = scrolledtext.ScrolledText(self, height=8, wrap=tk.WORD)
+        self.prompt_text.grid(row=5, column=1, sticky="nsew", **pad)
+
+        self.send_btn = ttk.Button(self, text="Отправить", command=self._on_send)
+        self.send_btn.grid(row=6, column=1, sticky="e", **pad)
+
+        self.status_var = tk.StringVar(value="Готов")
+        ttk.Label(self, textvariable=self.status_var, foreground="gray").grid(
+            row=7, column=0, columnspan=2, sticky="w", **pad
+        )
+
+        self.grid_rowconfigure(5, weight=1)
+        self.grid_columnconfigure(1, weight=1)
+
+    # ---------- Отправка запроса ----------
+
+    def _on_send(self):
+        if self._busy:
+            return
+        prompt = self.prompt_text.get("1.0", tk.END).strip()
+        if not prompt:
+            messagebox.showwarning("Пустой запрос", "Введите текст запроса.")
+            return
+
+        try:
+            temperature = float(self.temp_var.get())
+            max_tokens = int(self.tokens_var.get())
+        except ValueError:
+            messagebox.showerror(
+                "Неверные параметры",
+                "Temperature должно быть числом, Max tokens — целым числом.",
+            )
+            return
+
+        params = {
+            "model": self.model_var.get(),
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": self.stream_var.get() == "Да",
+        }
+        messages = [
+            {"role": "system", "content": self.system_text.get("1.0", tk.END).strip()},
+            {"role": "user", "content": prompt},
+        ]
+
+        self._busy = True
+        self.send_btn.config(state="disabled")
+        self.status_var.set("Запрос отправлен, ожидание ответа…")
+
+        threading.Thread(
+            target=self._request_worker, args=(params, messages), daemon=True
+        ).start()
+
+    def _request_worker(self, params, messages):
+        """Запрос — в фоновом потоке, чтобы UI не зависал."""
+        try:
+            if params["stream"]:
+                chunks = []
+                stream = self.client.chat.completions.create(
+                    model=params["model"],
+                    messages=messages,
+                    temperature=params["temperature"],
+                    max_tokens=params["max_tokens"],
+                    stream=True,
+                )
+                for chunk in stream:
+                    delta = chunk.choices[0].delta.content
+                    if delta:
+                        chunks.append(delta)
+                answer = "".join(chunks)
+            else:
+                resp = self.client.chat.completions.create(
+                    model=params["model"],
+                    messages=messages,
+                    temperature=params["temperature"],
+                    max_tokens=params["max_tokens"],
+                    stream=False,
+                )
+                answer = resp.choices[0].message.content
+
+            self.after(0, self._show_response, params["model"], answer)
+        except Exception as exc:
+            self.after(0, self._show_error, exc)
+        finally:
+            self.after(0, self._reset_state)
+
+    def _reset_state(self):
+        self._busy = False
+        self.send_btn.config(state="normal")
+        self.status_var.set("Готов")
+
+    def _show_error(self, exc):
+        messagebox.showerror("Ошибка API", f"{type(exc).__name__}: {exc}")
+
+    # ---------- UI: окно ответа ----------
+
+    def _show_response(self, model, answer):
+        win = tk.Toplevel(self)
+        win.title(f"Ответ — {model}")
+        win.geometry("700x500")
+
+        text = scrolledtext.ScrolledText(win, wrap=tk.WORD, font=("TkDefaultFont", 11))
+        text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        text.insert("1.0", answer)
+        text.config(state="disabled")
+
+        btns = ttk.Frame(win)
+        btns.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+        def copy():
+            self.clipboard_clear()
+            self.clipboard_append(answer)
+
+        ttk.Button(btns, text="Копировать", command=copy).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(btns, text="Закрыть", command=win.destroy).pack(side=tk.RIGHT)
+
+
+if __name__ == "__main__":
+    app = DeepSeekAgent()
+    if app.winfo_exists():
+        app.mainloop()
